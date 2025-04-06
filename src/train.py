@@ -129,7 +129,7 @@ def visualize_batch(images, noisy_images, outputs, epoch, batch_idx, texts=None,
     """
     if clearml_logger is None:
         return
-        
+
     # Select a few samples
     num_samples = min(1, images.size(0))
     
@@ -475,7 +475,7 @@ def train(model, train_loader, val_loader, optimizer, device, num_epochs=10, sav
             })
             
             # Очищаем переменные для высвобождения памяти
-            del images, noisy_images, loss
+            # del images, noisy_images, loss
             # Сохраняем outputs['predicted_image'] для visualize_batch ниже
             predicted_image = outputs['predicted_image'].detach()
             del outputs
@@ -484,17 +484,20 @@ def train(model, train_loader, val_loader, optimizer, device, num_epochs=10, sav
             if debug and max_batches_per_epoch and batch_idx >= max_batches_per_epoch:
                 break
         
+        # Visualize only in certain batches and end of epoch
         visualize_batch(
-            images if 'images' in locals() else None, 
-            noisy_images if 'noisy_images' in locals() else None, 
+            images, 
+            noisy_images, 
             predicted_image, 
             epoch+1, 
             batch_idx, 
             desc="train",
-            texts=texts if 'texts' in locals() else None, 
+            texts=texts, 
             clearml_logger=clearml_logger
         )
-        
+
+        del images, noisy_images, loss
+
         # Очищаем оставшиеся переменные
         if 'predicted_image' in locals():
             del predicted_image
