@@ -50,7 +50,9 @@ class ImageTextGenerator(nn.Module):
         gpt2_hidden_size = self.gpt2.config.hidden_size
         vit_hidden_size = self.vit.embed_dim
         self.vit_embed_dim = vit_hidden_size
-        
+
+        assert latent_dim == gpt2_hidden_size, "latent_dim must be equal to gpt2_hidden_size, got {} and {}".format(latent_dim, gpt2_hidden_size)
+
         # Linear layer to match dimensions if needed
         self.linear_projection = None
         if vit_hidden_size != gpt2_hidden_size:
@@ -62,7 +64,7 @@ class ImageTextGenerator(nn.Module):
         self.expected_patches = self.num_patches
         
         # Decoder input projection (latent space -> GPT hidden size)
-        self.decoder_input = nn.Linear(latent_dim, gpt2_hidden_size)
+        # self.decoder_input = nn.Linear(latent_dim, gpt2_hidden_size)
         
         # Cross-attention layer for text-to-patch interactions
         self.cross_attention = nn.MultiheadAttention(
@@ -84,20 +86,56 @@ class ImageTextGenerator(nn.Module):
             
         self.patch_pos_embedding = nn.Parameter(pos_emb, requires_grad=False)
         
-        # Patch decoder - processes embeddings + text to pixels
+        # Заменяем линейный декодер патчей на свёрточный
+        # Начальный размер тензора: [batch_size, gpt2_hidden_size * 2] (эмбеддинг + текстовый контекст)
         self.patch_decoder = nn.Sequential(
-            nn.Linear(gpt2_hidden_size * 2, 512),  # Embedding dim + text context
+            # Первый линейный слой для преобразования вектора в начальную свёртку
+            nn.Linear(gpt2_hidden_size * 2, 512),
             nn.LayerNorm(512),
             nn.GELU(),
-            nn.Linear(512, 1024),
-            nn.LayerNorm(1024),
-            nn.GELU(),
-            nn.Linear(1024, 3 * self.patch_size * self.patch_size),  # 3 channel colors for patch
+            # Преобразуем вектор в 3D тензор для свёрток
+            # Размеры: [batch_size, 128, 2, 2]
+            nn.Linear(512, 128 * 2 * 2),
+            nn.Unflatten(1, (128, 2, 2)),
+            # Свёрточная часть, увеличивающая разрешение
+            # Transposed Conv: [batch_size, 128, 2, 2] -> [batch_size, 64, 4, 4]
+            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2),
+            # Transposed Conv: [batch_size, 64, 4, 4] -> [batch_size, 32, 8, 8]
+            nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.2),
+            # Transposed Conv: [batch_size, 32, 8, 8] -> [batch_size, 16, 16, 16]
+            nn.ConvTranspose2d(32, 16, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.BatchNorm2d(16),
+            nn.LeakyReLU(0.2),
+            # Transposed Conv: [batch_size, 16, 16, 16] -> [batch_size, 3, 32, 32]
+            nn.ConvTranspose2d(16, 3, kernel_size=3, stride=2, padding=1, output_padding=1),
+        )
+        
+        # Новый слой self-attention для обработки декодированных патчей с зашумленными патчами
+        self.patch_self_attention = nn.MultiheadAttention(
+            embed_dim=3 * self.patch_size * self.patch_size,
+            num_heads=4,
+            dropout=0.1,
+            batch_first=True
+        )
+        
+        # Сверточные слои для улучшения качества декодированных патчей
+        self.patch_refinement = nn.Sequential(
+            nn.Conv2d(6, 64, kernel_size=3, padding=1),  # 6 channels (3 decoded + 3 noisy)
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(32, 3, kernel_size=3, padding=1),
         )
 
         # VAE components for latent space
-        self.fc_mu = nn.Linear(vit_hidden_size, latent_dim)
-        self.fc_var = nn.Linear(vit_hidden_size, latent_dim)
+        self.fc_mu = nn.Linear(vit_hidden_size, gpt2_hidden_size)
+        self.fc_var = nn.Linear(vit_hidden_size, gpt2_hidden_size)
 
     def init_sd_pipeline(self):
         self.sd_pipeline = StableDiffusionPipeline.from_pretrained(
@@ -164,29 +202,43 @@ class ImageTextGenerator(nn.Module):
         z = mu + eps * std               # Reparameterization
         return z
     
-    def decode_image(self, z, text_embeddings):
+    def decode_image(self, z, text_embeddings, noisy_image=None):
         """
-        Decode patch embeddings to image with text context
+        Decode patch embeddings to image with text context and optional noisy image
         
         Args:
             z: Patch embeddings [batch_size, num_patches, latent_dim]
             text_embeddings: Text embeddings [batch_size, text_seq_len, embed_dim]
+            noisy_image: Optional noisy image [batch_size, 3, H, W] to guide generation
             
         Returns:
             Reconstructed image [batch_size, 3, H, W]
         """
         batch_size = z.size(0)
         
-        # Проецируем латентные векторы в размерность GPT2, если они имеют размер latent_dim
-        if z.size(2) != self.gpt2.config.hidden_size:
-            # Project from latent_dim to GPT2 hidden size
-            z = self.decoder_input(z)
-        
         # Create a text context vector by averaging text embeddings
         text_context = text_embeddings.mean(dim=1, keepdim=True)  # [batch_size, 1, embed_dim]
 
+        # Подготовим зашумленные патчи, если они предоставлены
+        noisy_patches = None
+        if noisy_image is not None:
+            # Разбить noisy_image на патчи
+            noisy_patches = []
+            h = w = int(self.image_size // self.patch_size)
+            
+            for i in range(h):
+                for j in range(w):
+                    # Извлекаем патч из noisy_image
+                    y_start = i * self.patch_size
+                    y_end = (i + 1) * self.patch_size
+                    x_start = j * self.patch_size
+                    x_end = (j + 1) * self.patch_size
+                    
+                    patch = noisy_image[:, :, y_start:y_end, x_start:x_end]  # [batch_size, 3, patch_size, patch_size]
+                    noisy_patches.append(patch)
+
         # Process each patch with position and text context
-        patches = []
+        decoded_patches = []
         for p in range(self.expected_patches):
             # Get position embedding for this patch
             pos_emb = self.patch_pos_embedding[:, p:p+1, :].expand(batch_size, -1, -1)
@@ -199,12 +251,53 @@ class ImageTextGenerator(nn.Module):
             
             # Concatenate with text context for rich contextual information
             patch_with_context = torch.cat([patch_emb, text_context], dim=2)
-            # Decode patch to pixels
+            
+            # Decode patch to pixels используя свёрточный декодер
             decoded_patch = self.patch_decoder(patch_with_context.view(batch_size, -1))
             
-            # Reshape to patch dimensions
-            decoded_patch = decoded_patch.view(batch_size, 3, self.patch_size, self.patch_size)
-            patches.append(decoded_patch)
+            # Reshape not needed, свёрточный декодер уже выдаёт тензор [batch_size, 3, patch_size, patch_size]
+            patch_pixels = decoded_patch
+            
+            # Если есть зашумленный патч, добавляем информацию из него
+            if noisy_patches is not None:
+                # Получаем соответствующий зашумленный патч
+                noisy_patch = noisy_patches[p]
+                
+                # Конкатенируем каналы для сверточной обработки
+                combined_patch = torch.cat([patch_pixels, noisy_patch], dim=1)  # [batch_size, 6, patch_size, patch_size]
+                
+                # Применяем сверточную сеть для уточнения патча
+                refined_patch = self.patch_refinement(combined_patch)
+                
+                # Сохраняем обработанный патч
+                decoded_patches.append(refined_patch)
+            else:
+                decoded_patches.append(patch_pixels)
+        
+        # Если у нас есть зашумленные патчи, применяем self-attention между всеми патчами
+        if noisy_patches is not None and len(decoded_patches) > 1:
+            # Преобразуем список патчей в последовательность для self-attention
+            # [batch_size, num_patches, 3 * patch_size * patch_size]
+            patches_seq = []
+            for patch in decoded_patches:
+                flat_patch = patch.reshape(batch_size, 3 * self.patch_size * self.patch_size, 1)
+                patches_seq.append(flat_patch)
+            
+            patches_seq = torch.cat(patches_seq, dim=2).transpose(1, 2)  # [batch_size, num_patches, features]
+            
+            # Применяем self-attention
+            attended_patches, _ = self.patch_self_attention(
+                query=patches_seq,
+                key=patches_seq,
+                value=patches_seq
+            )
+            
+            # Преобразуем обратно в список патчей
+            decoded_patches = []
+            for p in range(self.expected_patches):
+                patch_flat = attended_patches[:, p, :]
+                patch = patch_flat.view(batch_size, 3, self.patch_size, self.patch_size)
+                decoded_patches.append(patch)
         
         # Assemble patches into full image
         h = w = int(self.image_size // self.patch_size)
@@ -214,7 +307,7 @@ class ImageTextGenerator(nn.Module):
             row_patches = []
             for j in range(w):
                 patch_idx = i * w + j
-                row_patches.append(patches[patch_idx])
+                row_patches.append(decoded_patches[patch_idx])
             
             # Concatenate patches in the row
             row = torch.cat(row_patches, dim=3)  # Concat along width dimension
@@ -316,8 +409,8 @@ class ImageTextGenerator(nn.Module):
         # 4. Sample from latent space using reparameterization trick for each patch
         z = self.reparameterize(mu, log_var)  # [batch, num_patches, latent_dim]
         
-        # 5. Decode sampled latent vectors patch by patch
-        predicted_image = self.decode_image(z, text_embeddings)  # decode_image handles patch-wise decoding
+        # 5. Decode sampled latent vectors patch by patch с учетом зашумленного изображения
+        predicted_image = self.decode_image(z, text_embeddings, noisy_image)  # Передаем noisy_image
         reconstruction_loss = torch.nn.functional.mse_loss(
             predicted_image,
             original_image

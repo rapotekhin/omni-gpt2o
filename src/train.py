@@ -141,20 +141,21 @@ def visualize_batch(images, noisy_images, outputs, epoch, batch_idx, texts=None,
         # Create figure with subplots
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
         
-        # Original image
-        orig_img = images[i].cpu().detach() * std.cpu() + mean.cpu()
-        orig_img = orig_img.permute(1, 2, 0).float().numpy()
-        orig_img = np.clip(orig_img, 0, 1)
-        
-        # noisy image
-        noisy_img = noisy_images[i].cpu().detach() * std.cpu() + mean.cpu()
-        noisy_img = noisy_img.permute(1, 2, 0).float().numpy()
-        noisy_img = np.clip(noisy_img, 0, 1)
-        
-        # outputs image
-        output_img = outputs[i].cpu().detach() * std.cpu() + mean.cpu()
-        output_img = output_img.permute(1, 2, 0).float().numpy()
-        output_img = np.clip(output_img, 0, 1)
+        # Original image - детач и конвертация в CPU до любых операций
+        with torch.no_grad():
+            orig_img = images[i].cpu().detach() * std.cpu() + mean.cpu()
+            orig_img = orig_img.permute(1, 2, 0).float().numpy()
+            orig_img = np.clip(orig_img, 0, 1)
+            
+            # noisy image
+            noisy_img = noisy_images[i].cpu().detach() * std.cpu() + mean.cpu()
+            noisy_img = noisy_img.permute(1, 2, 0).float().numpy()
+            noisy_img = np.clip(noisy_img, 0, 1)
+            
+            # outputs image
+            output_img = outputs[i].cpu().detach() * std.cpu() + mean.cpu()
+            output_img = output_img.permute(1, 2, 0).float().numpy()
+            output_img = np.clip(output_img, 0, 1)
 
         # Plot images
         axes[0].imshow(orig_img)
@@ -180,18 +181,31 @@ def visualize_batch(images, noisy_images, outputs, epoch, batch_idx, texts=None,
         # Save figure to temporary file and load with PIL
         temp_path = f"generated_samples/temp_plot_{epoch}_{batch_idx}_{i}.png"
         plt.savefig(temp_path)
-        image_from_plot = Image.open(temp_path).convert('RGB')  # Convert to RGB mode
-
-        clearml_logger.get_logger().report_image(
-            title=f"(Images {epoch})",
-            series=f"{desc} sample {i} (batch {batch_idx})", 
-            image=image_from_plot,
-            iteration=epoch
-        )
-
-        os.remove(temp_path)  # Clean up temp file
-        plt.close()
-
+        
+        try:
+            image_from_plot = Image.open(temp_path).convert('RGB')  # Convert to RGB mode
+            clearml_logger.get_logger().report_image(
+                title=f"(Images {epoch})",
+                series=f"{desc} sample {i} (batch {batch_idx})", 
+                image=image_from_plot,
+                iteration=epoch
+            )
+            # Явно закрываем изображение
+            image_from_plot.close()
+        except Exception as e:
+            print(f"Error reporting image to ClearML: {e}")
+        finally:
+            # Всегда удаляем временный файл
+            if os.path.exists(temp_path):
+                os.remove(temp_path)  # Clean up temp file
+        
+        # Очистка matplotlib
+        plt.close(fig)
+        
+    # Явно очищаем кэш CUDA
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        
 def validate(model, val_loader, device, kl_weight=0.01, epoch=0, debug=False, max_batches=None, clearml_logger=None):
     """
     Проверяет модель на валидационном наборе данных.
@@ -243,16 +257,20 @@ def validate(model, val_loader, device, kl_weight=0.01, epoch=0, debug=False, ma
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 loss, outputs = model(texts, images, noisy_images, kl_weight=kl_weight)
             
-            # Извлекаем компоненты функции потерь
-            mse_loss = outputs['mse_loss']
-            kl_loss = outputs['kl_loss']
-            recon_loss = outputs['reconstruction_loss']
+            # Явный детач для всех выходных тензоров
+            outputs = {k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in outputs.items()}
             
-            # Обновляем метрики
-            total_loss += loss.item()
-            total_mse_loss += mse_loss.item()
-            total_kl_loss += kl_loss.item()
-            total_recon_loss += recon_loss.item()
+            # Извлекаем компоненты функции потерь
+            mse_loss = outputs['mse_loss'].item()  # Используем .item() вместо хранения тензора
+            kl_loss = outputs['kl_loss'].item()
+            recon_loss = outputs['reconstruction_loss'].item()
+            loss_value = loss.item()
+            
+            # Обновляем метрики (используем числа, а не тензоры)
+            total_loss += loss_value
+            total_mse_loss += mse_loss
+            total_kl_loss += kl_loss
+            total_recon_loss += recon_loss
             batch_count += 1
             
             # Отображаем текущие значения метрик
@@ -275,9 +293,16 @@ def validate(model, val_loader, device, kl_weight=0.01, epoch=0, debug=False, ma
                     clearml_logger=clearml_logger
                 )
             
+            # Очищаем ненужные переменные
+            del images, noisy_images, outputs, loss
+            
             # Ограничиваем количество батчей в режиме отладки
             if debug and max_batches and batch_idx >= max_batches - 1:
                 break
+        
+        # Очищаем кэш CUDA в конце валидации
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     # Вычисляем средние значения метрик
     avg_loss = total_loss / batch_count if batch_count > 0 else 0
@@ -295,9 +320,27 @@ def validate(model, val_loader, device, kl_weight=0.01, epoch=0, debug=False, ma
 def train(model, train_loader, val_loader, optimizer, device, num_epochs=10, save_dir="models", 
           save_interval=5, debug=False, max_batches_per_epoch=None,
           latent_dim=256, kl_weight=0.01, use_clearml=False, warmup_epochs=5,
-          gradient_clip_value=1.0):
+          gradient_clip_value=1.0, start_epoch=0):
     """
     Train the model with optional debug mode
+    
+    Args:
+        model: модель для обучения
+        train_loader: даталоадер с обучающими данными
+        val_loader: даталоадер с валидационными данными
+        optimizer: оптимизатор
+        device: устройство для вычислений
+        num_epochs: общее количество эпох
+        save_dir: директория для сохранения чекпоинтов
+        save_interval: интервал сохранения чекпоинтов (в эпохах)
+        debug: флаг отладочного режима
+        max_batches_per_epoch: максимальное число батчей в эпохе (для отладки)
+        latent_dim: размерность латентного пространства
+        kl_weight: вес KL-дивергенции в функции потерь
+        use_clearml: флаг использования ClearML для логирования
+        warmup_epochs: количество эпох разогрева для планировщика скорости обучения
+        gradient_clip_value: максимальная норма градиента для отсечения
+        start_epoch: начальная эпоха (для продолжения обучения)
     """
     # Create directory for saving models
     os.makedirs(save_dir, exist_ok=True)
@@ -329,10 +372,16 @@ def train(model, train_loader, val_loader, optimizer, device, num_epochs=10, sav
     # Создаем планировщик обучения
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=cosine_schedule_with_warmup)
     
+    # Если мы продолжаем обучение, нужно правильно настроить планировщик
+    if start_epoch > 0:
+        # Делаем шаги планировщика, чтобы достичь правильного значения LR
+        for _ in range(start_epoch * len(train_loader)):
+            scheduler.step()
+    
     model.train()
     best_loss = float('inf')
     
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         epoch_start_time = time.time()
         total_loss = 0
         total_mse_loss = 0
@@ -364,10 +413,10 @@ def train(model, train_loader, val_loader, optimizer, device, num_epochs=10, sav
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 loss, outputs = model(texts, images, noisy_images, kl_weight=kl_weight)
             
-            # Extract individual loss components
-            mse_loss = outputs['mse_loss']
-            kl_loss = outputs['kl_loss']
-            recon_loss = outputs['reconstruction_loss']
+            # Extract individual loss components (используем .item() для скалярных значений)
+            mse_loss_value = outputs['mse_loss'].item()
+            kl_loss_value = outputs['kl_loss'].item()
+            recon_loss_value = outputs['reconstruction_loss'].item()
             
             # Backward pass
             optimizer.zero_grad()
@@ -410,11 +459,11 @@ def train(model, train_loader, val_loader, optimizer, device, num_epochs=10, sav
                         title="Gradients", series="Gradient Norm", 
                         value=grad_norm, iteration=epoch * len(train_loader) + batch_idx)
             
-            # Update metrics
+            # Update metrics using scalar values
             total_loss += loss.item()
-            total_mse_loss += mse_loss.item()
-            total_kl_loss += kl_loss.item()
-            total_recon_loss += recon_loss.item()
+            total_mse_loss += mse_loss_value
+            total_kl_loss += kl_loss_value
+            total_recon_loss += recon_loss_value
             
             progress_bar.set_postfix({
                 'loss': total_loss / (batch_idx + 1),
@@ -424,21 +473,37 @@ def train(model, train_loader, val_loader, optimizer, device, num_epochs=10, sav
                 'lr': current_lr,
                 'grad': grad_norm
             })
+            
+            # Очищаем переменные для высвобождения памяти
+            del images, noisy_images, loss
+            # Сохраняем outputs['predicted_image'] для visualize_batch ниже
+            predicted_image = outputs['predicted_image'].detach()
+            del outputs
 
             # Limit batches per epoch in debug mode
             if debug and max_batches_per_epoch and batch_idx >= max_batches_per_epoch:
                 break
         
         visualize_batch(
-            images, 
-            noisy_images, 
-            outputs['predicted_image'], 
+            images if 'images' in locals() else None, 
+            noisy_images if 'noisy_images' in locals() else None, 
+            predicted_image, 
             epoch+1, 
             batch_idx, 
             desc="train",
-            texts=texts, 
+            texts=texts if 'texts' in locals() else None, 
             clearml_logger=clearml_logger
         )
+        
+        # Очищаем оставшиеся переменные
+        if 'predicted_image' in locals():
+            del predicted_image
+        if 'texts' in locals():
+            del texts
+        
+        # Очистка CUDA кэша
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
         # Calculate epoch stats
         num_batches = batch_idx + 1
@@ -525,6 +590,62 @@ def train(model, train_loader, val_loader, optimizer, device, num_epochs=10, sav
     
     writer.close()
 
+
+def load_checkpoint(model, checkpoint_path, device, latent_dim, optimizer=None):
+    start_epoch = 0
+    if checkpoint_path is not None:
+        if os.path.isfile(checkpoint_path):
+            print(f"Loading checkpoint from {checkpoint_path}")
+            try:
+                # Сначала пробуем загрузить с weights_only=False для безопасности
+                checkpoint = torch.load(checkpoint_path, map_location=device)
+                
+                # Загружаем веса модели выборочно
+                model_state = model.state_dict()
+                checkpoint_state = checkpoint['model_state_dict']
+                
+                # Загружаем только те веса, которые совпадают по размерам
+                for name, param in checkpoint_state.items():
+                    if name in model_state:
+                        try:
+                            if model_state[name].shape == param.shape:
+                                model_state[name].copy_(param)
+                                print(f"Loaded layer: {name}")
+                            else:
+                                print(f"Skipped layer due to shape mismatch: {name}")
+                        except Exception as e:
+                            print(f"Error loading layer {name}: {str(e)}")
+                
+                try:
+                    # Пробуем загрузить состояние оптимизатора
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    print("Loaded optimizer state")
+                except Exception as e:
+                    print(f"Could not load optimizer state: {str(e)}")
+                
+                # Получаем информацию о чекпоинте
+                start_epoch = checkpoint.get('epoch', 0)
+                print(f"Loaded checkpoint from epoch {start_epoch}, continuing training...")
+                
+                # Проверяем соответствие latent_dim
+                checkpoint_latent_dim = checkpoint.get('latent_dim', latent_dim)
+                if checkpoint_latent_dim != latent_dim:
+                    print(f"WARNING: Checkpoint latent_dim ({checkpoint_latent_dim}) differs from "
+                          f"provided latent_dim ({latent_dim})!")
+                
+                # Освобождаем память
+                del checkpoint
+                torch.cuda.empty_cache()
+                
+            except Exception as e:
+                print(f"Error loading checkpoint: {str(e)}")
+                print("Starting from scratch")
+                start_epoch = 0
+        else:
+            print(f"WARNING: Checkpoint file not found at {checkpoint_path}, starting from scratch.")
+
+    return start_epoch
+
 def main():
     # Parse arguments
     parser = argparse.ArgumentParser(description="Train the ViT-VAE model")
@@ -534,13 +655,15 @@ def main():
     parser.add_argument("--max_train_samples", type=int, default=20000, help="Maximum number of samples to use")
     parser.add_argument("--max_val_samples", type=int, default=200, help="Maximum number of samples to use")
     parser.add_argument("--save_interval", type=int, default=5, help="Save checkpoint every N epochs")
-    parser.add_argument("--latent_dim", type=int, default=256, help="Dimension of latent space")
+    parser.add_argument("--latent_dim", type=int, default=768, help="Dimension of latent space")
     parser.add_argument("--kl_weight", type=float, default=0.01, help="Weight for KL divergence loss")
     parser.add_argument("--use_clearml", action="store_true", help="Use ClearML for experiment tracking")
-    parser.add_argument("--warmup_epochs", type=int, default=20, help="Number of epochs for warmup")
+    parser.add_argument("--warmup_epochs", type=int, default=3, help="Number of epochs for warmup")
     parser.add_argument("--gradient_clip", type=float, default=1.0, help="Gradient clipping value")
     parser.add_argument("--learning_rate", "--lr", type=float, default=1e-4, help="Initial learning rate")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--checkpoint_path", type=str, default=None, 
+                        help="Path to checkpoint file to resume training from")
     args = parser.parse_args()
 
     # Устанавливаем seed для воспроизводимости
@@ -549,7 +672,7 @@ def main():
     # Инициализируем ClearML
     if args.use_clearml and Task is not None:
         print("Initializing ClearML tracking")
-        task_name = f"omni-gpt2o_latent{args.latent_dim}_{'debug' if args.debug else 'train'}"
+        task_name = f"omni-gpt2o_latent{args.latent_dim}_{'debug' if args.debug else 'train'}_2"
         task = Task.init(project_name="Other/omni-gpt2o", task_name=task_name, 
                          auto_connect_frameworks={'pytorch': False})
     
@@ -572,6 +695,15 @@ def main():
     print(f"Initializing model with latent_dim={args.latent_dim}...")
     model = ImageTextGenerator(device=device, latent_dim=args.latent_dim)
     model = model.to(device)
+    
+    # Initialize optimizer (only for trainable parameters)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
+    
+    # Загрузка чекпоинта при необходимости
+    start_epoch = load_checkpoint(model, args.checkpoint_path, device, args.latent_dim, optimizer=optimizer)
+    
+    print(f"Training with learning rate: {args.learning_rate}")
     
     # Create dataset and dataloader
     print("Loading dataset...")
@@ -599,11 +731,6 @@ def main():
         num_workers=2 if args.debug else 4,
         pin_memory=True
     )
-    # Initialize optimizer (only for trainable parameters)
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
-    
-    print(f"Training with learning rate: {args.learning_rate}")
     
     # Train the model
     print("Starting training...")
@@ -622,7 +749,8 @@ def main():
         kl_weight=args.kl_weight,
         use_clearml=args.use_clearml,
         warmup_epochs=args.warmup_epochs,
-        gradient_clip_value=args.gradient_clip
+        gradient_clip_value=args.gradient_clip,
+        start_epoch=start_epoch
     )
     
     print("Training completed!")

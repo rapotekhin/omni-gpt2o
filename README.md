@@ -2,6 +2,11 @@
 
 This project implements a research approach to image generation using GPT-2 and ViT (Vision Transformer) models, inspired by recent developments in native image generation capabilities of LLMs.
 
+
+### Architecture
+![Architecture](assets/omni-gpt2o.drawio-1.png)
+
+
 ## Project Structure
 
 ```
