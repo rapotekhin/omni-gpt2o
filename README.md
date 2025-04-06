@@ -4,7 +4,7 @@ This project implements a research approach to image generation using GPT-2 and 
 
 
 ### Architecture
-![Architecture](assets/omni-gpt2o.drawio-1.png)
+![Architecture](assets/omni-gpt2o.png)
 
 
 ## Project Structure

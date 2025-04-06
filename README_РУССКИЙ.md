@@ -4,7 +4,7 @@
 
 
 ### Архитектура
-![Архитектура](assets/omni-gpt2o.drawio-1.png)
+![Архитектура](assets/omni-gpt2o.png)
 
 
 ## Структура проекта
