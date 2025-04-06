@@ -320,7 +320,7 @@ class ImageTextGenerator(nn.Module):
     
     def forward(self, text, original_image, noisy_image, kl_weight=0.01):
         """
-        Forward pass with VAE components
+        Forward pass with VAE components and token-wise processing
         
         Args:
             text: Text descriptions
@@ -353,83 +353,178 @@ class ImageTextGenerator(nn.Module):
         ).unsqueeze(1)  # Shape: [batch_size, 1, embedding_dim]
         
         # Concatenate text embeddings with EOS token and noisy image embeddings
-        # Shapes: text_embeddings [batch_size, text_seq_len, hidden_size]
-        #         eos_token_embedding [batch_size, 1, hidden_size]
-        #         noisy_vit_embeddings [batch_size, img_seq_len+1, hidden_size] (+1 for class token)
         combined_embeddings = torch.cat([text_embeddings, eos_token_embedding, noisy_vit_embeddings], dim=1)
 
-        # Auto-regressively generate exactly img_seq_len token embeddings
-        generated_embeddings = []
+        # Подготовка для хранения результатов обработки каждого токена
+        generated_embeddings = []  # Для накопления сгенерированных эмбеддингов
+        mu_list = []  # Для накопления mu
+        log_var_list = []  # Для накопления log_var
+        z_list = []  # Для накопления samplez
+        decoded_patches = []  # Для накопления декодированных патчей
+        
+        # Разделение зашумленного изображения на патчи
+        noisy_patches = None
+        if noisy_image is not None:
+            noisy_patches = []
+            h = w = int(self.image_size // self.patch_size)
+            
+            for i in range(h):
+                for j in range(w):
+                    y_start = i * self.patch_size
+                    y_end = (i + 1) * self.patch_size
+                    x_start = j * self.patch_size
+                    x_end = (j + 1) * self.patch_size
+                    
+                    patch = noisy_image[:, :, y_start:y_end, x_start:x_end]
+                    noisy_patches.append(patch)
+        
+        # Авторегрессивно генерируем эмбеддинги и сразу их обрабатываем
         current_context = combined_embeddings
         
-        for _ in range(self.expected_patches):
-            # Get outputs for the current context
+        for p in range(self.expected_patches):
+            # 1. Генерация следующего токена
             outputs = self.gpt2(inputs_embeds=current_context)
-            next_token_logits = outputs.logits[:, -1, :]  # Get logits for next token [batch, vocab_size]
+            next_token_logits = outputs.logits[:, -1, :]  # [batch, vocab_size]
             
-            # Convert logits to embedding size using the embedding matrix
+            # Преобразование логитов в эмбеддинг
             next_token_embedding = torch.matmul(
-                torch.softmax(next_token_logits, dim=-1),  # Apply softmax to get probabilities [batch, vocab_size]
-                self.gpt2.transformer.wte.weight  # Token embedding matrix [vocab_size, hidden_size]
-            ).unsqueeze(1)  # Add sequence dimension [batch, 1, hidden_size]
+                torch.softmax(next_token_logits, dim=-1),
+                self.gpt2.transformer.wte.weight
+            ).unsqueeze(1)  # [batch, 1, hidden_size]
             
-            # Add to generated list
+            # Добавляем в список
             generated_embeddings.append(next_token_embedding)
             
-            # Update context for next iteration by concatenating
+            # 2. Добавление позиционного эмбеддинга
+            pos_emb = self.patch_pos_embedding[:, p:p+1, :].expand(batch_size, -1, -1)
+            next_token_with_pos = next_token_embedding + pos_emb
+            
+            # 3. Применение cross-attention: токен слушает текст
+            attended_token, _ = self.cross_attention(
+                query=next_token_with_pos,
+                key=text_embeddings,
+                value=text_embeddings
+            )
+            
+            # 4. Вычисление компонентов VAE
+            mu_token = self.fc_mu(attended_token)  # [batch, 1, latent_dim]
+            log_var_token = self.fc_var(attended_token)  # [batch, 1, latent_dim]
+            
+            # Сохраняем для подсчета потерь
+            mu_list.append(mu_token)
+            log_var_list.append(log_var_token)
+            
+            # 5. Репараметризация для каждого токена
+            z_token = self.reparameterize(mu_token, log_var_token)  # [batch, 1, latent_dim]
+            z_list.append(z_token)
+            
+            # 6. Декодирование патча из латентного представления
+            # Создаем текстовый контекст
+            text_context = text_embeddings.mean(dim=1, keepdim=True)  # [batch_size, 1, embed_dim]
+            
+            # Подготовка к декодированию
+            patch_with_context = torch.cat([z_token, text_context], dim=2)
+            
+            # Декодируем патч
+            decoded_patch = self.patch_decoder(patch_with_context.view(batch_size, -1))
+            
+            # 7. Если есть зашумленный патч, используем его для улучшения
+            if noisy_patches is not None:
+                noisy_patch = noisy_patches[p]  # Берем соответствующий патч
+                
+                # Объединяем декодированный и зашумленный патчи
+                combined_patch = torch.cat([decoded_patch, noisy_patch], dim=1)  # [batch, 6, patch_size, patch_size]
+                
+                # Применяем сеть уточнения
+                refined_patch = self.patch_refinement(combined_patch)
+                
+                # Сохраняем обработанный патч
+                decoded_patches.append(refined_patch)
+            else:
+                decoded_patches.append(decoded_patch)
+            
+            # Обновляем контекст для следующей итерации
             current_context = torch.cat([current_context, next_token_embedding], dim=1)
         
-        # Stack the generated embeddings
-        predicted_image_embeddings = torch.cat(generated_embeddings, dim=1)
-
-        # Compute losses
-        # 1. MSE loss between predicted embeddings and original embeddings
+        # Объединяем результаты всех токенов
+        predicted_image_embeddings = torch.cat(generated_embeddings, dim=1)  # [batch, num_patches, embed_dim]
+        mu = torch.cat(mu_list, dim=1)  # [batch, num_patches, latent_dim]
+        log_var = torch.cat(log_var_list, dim=1)  # [batch, num_patches, latent_dim]
+        z = torch.cat(z_list, dim=1)  # [batch, num_patches, latent_dim]
+        
+        # Применяем self-attention между всеми патчами если их больше одного
+        if len(decoded_patches) > 1:
+            # Подготавливаем последовательность патчей для self-attention
+            patches_seq = []
+            for patch in decoded_patches:
+                flat_patch = patch.reshape(batch_size, 3 * self.patch_size * self.patch_size, 1)
+                patches_seq.append(flat_patch)
+            
+            patches_seq = torch.cat(patches_seq, dim=2).transpose(1, 2)  # [batch, num_patches, features]
+            
+            # Применяем self-attention
+            attended_patches, _ = self.patch_self_attention(
+                query=patches_seq,
+                key=patches_seq,
+                value=patches_seq
+            )
+            
+            # Преобразуем обратно в список патчей
+            decoded_patches = []
+            for p in range(self.expected_patches):
+                patch_flat = attended_patches[:, p, :]
+                patch = patch_flat.view(batch_size, 3, self.patch_size, self.patch_size)
+                decoded_patches.append(patch)
+        
+        # Собираем полное изображение из патчей
+        h = w = int(self.image_size // self.patch_size)
+        rows = []
+        
+        for i in range(h):
+            row_patches = []
+            for j in range(w):
+                patch_idx = i * w + j
+                row_patches.append(decoded_patches[patch_idx])
+            
+            # Объединяем патчи в ряд
+            row = torch.cat(row_patches, dim=3)  # вдоль ширины
+            rows.append(row)
+        
+        # Объединяем ряды в изображение
+        predicted_image = torch.cat(rows, dim=2)  # вдоль высоты
+        predicted_image = torch.sigmoid(predicted_image)  # Гарантируем, что значения пикселей в [0, 1]
+        
+        # Вычисляем потери
+        # 1. MSE между предсказанными и оригинальными эмбеддингами
         mse_loss = torch.nn.functional.mse_loss(
             predicted_image_embeddings,
-            original_vit_embeddings[:, 1:, :]  # Exclude class token
+            original_vit_embeddings[:, 1:, :]  # Исключаем class token
         )
-
-        # Concatenate text context with image embeddings
-        patches_with_pos = predicted_image_embeddings + self.patch_pos_embedding
         
-        # Apply cross-attention: patches attend to text
-        attended_embeddings, _ = self.cross_attention(
-            query=patches_with_pos,
-            key=text_embeddings,
-            value=text_embeddings
-        )
-
-        # Calculate VAE components
-        mu = self.fc_mu(attended_embeddings)  # [batch, num_patches, latent_dim]
-        log_var = self.fc_var(attended_embeddings)  # [batch, num_patches, latent_dim]
+        # 2. KL дивергенция для VAE
+        kl_loss = self.kl_loss(mu, log_var)
         
-        # 3. KL divergence loss for VAE - computed per patch
-        kl_loss = self.kl_loss(mu, log_var)  # Already handles patch-wise computation
-        
-        # 4. Sample from latent space using reparameterization trick for each patch
-        z = self.reparameterize(mu, log_var)  # [batch, num_patches, latent_dim]
-        
-        # 5. Decode sampled latent vectors patch by patch с учетом зашумленного изображения
-        predicted_image = self.decode_image(z, text_embeddings, noisy_image)  # Передаем noisy_image
+        # 3. Потеря реконструкции
         reconstruction_loss = torch.nn.functional.mse_loss(
             predicted_image,
             original_image
         )
         
-        # Combine losses with weights
+        # Комбинируем потери с весами
         total_loss = mse_loss + kl_weight * kl_loss + reconstruction_loss
         
-        # Create outputs dictionary with all patch-wise components
+        # Создаем словарь выходных значений
         outputs = {
             'mse_loss': mse_loss,
             'kl_loss': kl_loss, 
             'reconstruction_loss': reconstruction_loss,
-            'predicted_embeddings': predicted_image_embeddings,  # [batch, num_patches, embed_dim]
+            'predicted_embeddings': predicted_image_embeddings,
             'predicted_image': predicted_image,
-            'mu': mu,  # [batch, num_patches, latent_dim]
-            'log_var': log_var,  # [batch, num_patches, latent_dim] 
-            'sampled_z': z  # [batch, num_patches, latent_dim]
+            'mu': mu,
+            'log_var': log_var,
+            'sampled_z': z
         }
+        
         return total_loss, outputs
     
 

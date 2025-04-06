@@ -296,10 +296,6 @@ def validate(model, val_loader, device, kl_weight=0.01, epoch=0, debug=False, ma
             # Очищаем ненужные переменные
             del images, noisy_images, outputs, loss
             
-            # Ограничиваем количество батчей в режиме отладки
-            if debug and max_batches and batch_idx >= max_batches - 1:
-                break
-        
         # Очищаем кэш CUDA в конце валидации
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -480,10 +476,6 @@ def train(model, train_loader, val_loader, optimizer, device, num_epochs=10, sav
             predicted_image = outputs['predicted_image'].detach()
             del outputs
 
-            # Limit batches per epoch in debug mode
-            if debug and max_batches_per_epoch and batch_idx >= max_batches_per_epoch:
-                break
-        
         # Visualize only in certain batches and end of epoch
         visualize_batch(
             images, 
@@ -688,7 +680,9 @@ def main():
         print("Running in DEBUG mode with reduced parameters")
         batch_size = 2
         num_epochs = 3
-        max_batches_per_epoch = 5
+        max_batches_per_epoch = 20
+        args.max_train_samples = 200
+        args.max_val_samples = 200
     else:
         batch_size = args.batch_size
         num_epochs = args.epochs
