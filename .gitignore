@@ -1,0 +1,16 @@
+/data
+/models
+/logs
+/generated_samples
+/venv
+/env
+/runs
+
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+*.pywz
